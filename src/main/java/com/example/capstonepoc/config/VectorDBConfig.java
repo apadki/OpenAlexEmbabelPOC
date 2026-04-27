@@ -4,6 +4,7 @@ import dev.langchain4j.store.embedding.qdrant.QdrantEmbeddingStore;
 import io.qdrant.client.QdrantClient;
 import io.qdrant.client.QdrantGrpcClient;
 import io.qdrant.client.grpc.Collections.Distance;
+import io.qdrant.client.grpc.Collections.PayloadSchemaType;
 import io.qdrant.client.grpc.Collections.VectorParams;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,11 +12,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-/**
- * Configuration class for Qdrant Vector Database initialization.
- * Provides a Spring Bean for QdrantEmbeddingStore with configurable
- * host, port, collection name, and dimension.
- */
+import java.util.List;
+
 @Configuration
 public class VectorDBConfig {
   private static final Logger logger = LoggerFactory.getLogger(VectorDBConfig.class);
@@ -26,63 +24,64 @@ public class VectorDBConfig {
   @Value("${qdrant.port:6334}")
   private int qdrantPort;
 
-  @Value("${qdrant.collection-name:default-collection}")
+  @Value("${qdrant.collection-name}")
   private String collectionName;
 
   @Value("${qdrant.dimension:768}")
   private int dimension;
 
-  /**
-   * Creates and initializes a QdrantEmbeddingStore bean.
-   *
-   * @return QdrantEmbeddingStore configured with application properties
-   */
   @Bean
   public QdrantEmbeddingStore qdrantEmbeddingStore() {
-    return initializeQdrantStore(collectionName, dimension);
-  }
+    // 1. Setup the Schema (The DDL)
+    setupSchema();
 
-  /**
-   * Initializes Qdrant store with specified collection name and dimension.
-   *
-   * @param collectionName the name of the collection
-   * @param dimension the dimension of the vectors
-   * @return initialized QdrantEmbeddingStore
-   */
-  public QdrantEmbeddingStore initializeQdrantStore(String collectionName, int dimension) {
-    // 1. Connect to the Qdrant gRPC client (faster for 100k records)
-    QdrantClient client = new QdrantClient(
-      QdrantGrpcClient.newBuilder(qdrantHost, qdrantPort, false).build()
-    );
-
-    try {
-      // 2. Check if collection exists; if not, create it
-      boolean exists = client.listCollectionsAsync().get()
-        .stream()
-        .anyMatch(c -> c.equals(collectionName));
-
-      if (!exists) {
-        client.createCollectionAsync(collectionName,
-          VectorParams.newBuilder()
-            .setDistance(Distance.Cosine) // Recommended for OpenAlex text
-            .setSize(dimension)           // Must match your EmbeddingModel
-            .build()
-        ).get();
-        logger.info("Collection created: {}", collectionName);
-      } else {
-        logger.info("Collection already exists: {}", collectionName);
-      }
-    } catch (Exception e) {
-      logger.error("Failed to initialize Qdrant collection", e);
-      throw new RuntimeException("Failed to initialize Qdrant collection", e);
-    }
-
-    // 3. Return the LangChain4j EmbeddingStore wrapper
+    // 2. Return the Store
     return QdrantEmbeddingStore.builder()
       .host(qdrantHost)
       .port(qdrantPort)
       .collectionName(collectionName)
       .build();
   }
-}
 
+  private void setupSchema() {
+    // Use the internal gRPC client
+    try (QdrantClient client = new QdrantClient(
+      QdrantGrpcClient.newBuilder(qdrantHost, qdrantPort, false).build())) {
+
+      List<String> collections = client.listCollectionsAsync().get();
+      boolean exists = collections.contains(collectionName);
+
+      if (!exists) {
+        logger.info("Executing DDL for collection: {}", collectionName);
+
+        // Create Table (Collection)
+        client.createCollectionAsync(collectionName,
+          VectorParams.newBuilder()
+            .setDistance(Distance.Cosine)
+            .setSize(dimension)
+            .build()
+        ).get();
+
+        // Define Schema Indexes (The DDL fields)
+        createPayloadIndex(client, "id", PayloadSchemaType.Keyword);
+        createPayloadIndex(client, "primary_topic", PayloadSchemaType.Keyword);
+        createPayloadIndex(client, "publisher", PayloadSchemaType.Keyword);
+        createPayloadIndex(client, "country", PayloadSchemaType.Keyword);
+        createPayloadIndex(client, "pub_year", PayloadSchemaType.Integer);
+        createPayloadIndex(client, "cited_by_count", PayloadSchemaType.Integer);
+        createPayloadIndex(client, "first_author", PayloadSchemaType.Text);
+        createPayloadIndex(client, "institution_names", PayloadSchemaType.Text);
+
+        logger.info("DDL successfully applied to Qdrant.");
+      }
+    } catch (Exception e) {
+      logger.error("Schema setup failed", e);
+      throw new RuntimeException(e);
+    }
+  }
+
+  private void createPayloadIndex(QdrantClient client, String fieldName, PayloadSchemaType type) throws Exception {
+    // Standard v1.13.0 signature: 7 arguments
+    client.createPayloadIndexAsync(collectionName, fieldName, type, null, true, null, null).get();
+  }
+}
